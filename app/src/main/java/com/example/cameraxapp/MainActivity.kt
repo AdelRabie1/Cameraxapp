@@ -1,36 +1,38 @@
 package com.example.cameraxapp
 
 import android.Manifest
-import android.content.ContentValues
-import android.content.pm.PackageManager
 import android.annotation.SuppressLint
+import android.content.ContentValues
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.*
+import android.media.Image
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.ImageCapture
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.cameraxapp.databinding.ActivityMainBinding
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import android.widget.Toast
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.core.Preview
-import androidx.camera.core.CameraSelector
-import android.util.Log
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
-import java.text.SimpleDateFormat
+import com.example.cameraxapp.utils.FaceContourGraphic
 import com.example.cameraxapp.utils.GraphicOverlay
-import java.util.Locale
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
-import com.example.cameraxapp.utils.FaceContourGraphic
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 
 class MainActivity : AppCompatActivity() {
@@ -38,6 +40,7 @@ class MainActivity : AppCompatActivity() {
 
     private var imageCapture: ImageCapture? = null
     private var preview: Preview? = null
+    private var imageAnalyzer: ImageAnalysis? = null
 
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var graphicOverlay: GraphicOverlay
@@ -96,16 +99,28 @@ class MainActivity : AppCompatActivity() {
                     Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
                 }
                 override fun onImageSaved(output: ImageCapture.OutputFileResults){
-                    val msg = "Photo capture succeeded: ${output.savedUri}"
-                    Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT).show()
-                    Log.d(TAG, msg)
                     val image: InputImage
                     try {
-                        image = InputImage.fromFilePath(context, output.savedUri)
+                        image = output.savedUri?.let { InputImage.fromFilePath(baseContext, it) }!!
+                        //if (image != null) {
+                            //val buffer: ByteBuffer = image.planes!![0].buffer
+                            //val bytes = ByteArray(buffer.capacity())
+                            //buffer.get(bytes)
+                            //val bitmapImage = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, null)
+                            //getRoundedCroppedBitmap(bitmapImage)
+                        //}
+
+                        val msg = "Photo capture succeeded: ${output.savedUri}"
+                        Log.d(TAG, msg)
+                        Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT).show()
+                        //processImage(image)
+
+
                     } catch (e: IOException) {
+                        Toast.makeText(baseContext, "yes", Toast.LENGTH_SHORT).show()
                         e.printStackTrace()
                     }
-                    processImage()
+
                 }
             }
         )
@@ -144,7 +159,41 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    @Throws(IOException::class)
+    private fun saveBitmap(
+        context: Context, bitmap: Bitmap, format: Bitmap.CompressFormat,
+        mimeType: String, displayName: String
+    ): Uri {
 
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM)
+        }
+
+        var uri: Uri? = null
+
+        return runCatching {
+            with(context.contentResolver) {
+                insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)?.also {
+                    uri = it // Keep uri reference so it can be removed on failure
+
+                    openOutputStream(it)?.use { stream ->
+                        if (!bitmap.compress(format, 95, stream))
+                            throw IOException("Failed to save bitmap.")
+                    } ?: throw IOException("Failed to open output stream.")
+
+                } ?: throw IOException("Failed to create new MediaStore record.")
+            }
+        }.getOrElse {
+            uri?.let { orphanUri ->
+                // Don't leave an orphan entry in the MediaStore
+                context.contentResolver.delete(orphanUri, null, null)
+            }
+
+            throw it
+        }
+    }
 
     override fun onDestroy() {
         super.onDestroy()
@@ -170,8 +219,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("UnsafeExperimentalUsageError")
-    private fun processImage(imageProxy: ImageProxy) {
-        val image = InputImage.fromMediaImage(imageProxy.image!!, imageProxy.imageInfo.rotationDegrees)
+    private fun processImage(imageProxy: InputImage) {
+        val image = imageProxy
         val realTimeOpts = FaceDetectorOptions.Builder()
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .enableTracking()
@@ -184,9 +233,9 @@ class MainActivity : AppCompatActivity() {
             .addOnFailureListener{ e -> // Task failed with an exception
                 e.printStackTrace()
             }
-            .addOnCompleteListener {
+            /*.addOnCompleteListener {
                 imageProxy.close()
-            }
+            }*/
     }
 
     private fun processFaces(faces: List<Face>) {
@@ -220,6 +269,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+
+
+    private fun getRoundedCroppedBitmap(bitmap: Bitmap): Bitmap? {
+        val widthLight = bitmap.width
+        val heightLight = bitmap.height
+        val output = Bitmap.createBitmap(
+            bitmap.width, bitmap.height,
+            Bitmap.Config.ARGB_8888
+        )
+        val canvas = Canvas(output)
+        val paintColor = Paint()
+        paintColor.flags = Paint.ANTI_ALIAS_FLAG
+        val rectF = RectF(Rect(0, 0, widthLight, heightLight))
+        canvas.drawRoundRect(rectF, (widthLight / 2).toFloat(), (heightLight / 2).toFloat(), paintColor)
+        val paintImage = Paint()
+        paintImage.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
+        canvas.drawBitmap(bitmap, 0f, 0f, paintImage)
+        saveBitmap(this, output, Bitmap.CompressFormat.JPEG, "image/jpeg", "edit")
+        return output
+    }
+
     companion object {
         private const val TAG = "CameraXApp"
         private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
@@ -235,3 +305,7 @@ class MainActivity : AppCompatActivity() {
             }.toTypedArray()
     }
 }
+
+
+
+
